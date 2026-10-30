@@ -91,18 +91,12 @@ final class Settings {
         set { defaults.set(newValue, forKey: "showMicButton") }
     }
 
-    private var cachedOpenAIKey: String??
-
     var openAIKey: String? {
-        if let cachedOpenAIKey { return cachedOpenAIKey }
-        let key = Keychain.read(Keychain.openAI) ?? ProcessInfo.processInfo.environment["OPENAI_API_KEY"]
-        cachedOpenAIKey = .some(key)
-        return key
+        keys.key(Keychain.openAI) ?? ProcessInfo.processInfo.environment["OPENAI_API_KEY"]
     }
 
-    func setOpenAIKey(_ key: String) -> Bool {
-        cachedOpenAIKey = nil
-        return Keychain.save(key, Keychain.openAI)
+    func setOpenAIKey(_ key: String, completion: @escaping @MainActor @Sendable (Bool) -> Void) {
+        keys.save(key, Keychain.openAI, completion: completion)
     }
 
     // MARK: Apps
@@ -159,17 +153,21 @@ final class Settings {
 
     // MARK: API key
 
-    private var cachedKey: String??
+    /// The keychain can stop and show a password prompt, so it's never touched on this (the main) thread.
+    private let keys = KeyStore()
 
-    var apiKey: String? {
-        if let cachedKey { return cachedKey }
-        let key = Keychain.read() ?? ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"]
-        cachedKey = .some(key)
-        return key
+    var keysLoaded: Bool { keys.isLoaded }
+
+    /// Reads both keys once, in the background. They're empty until `completion` runs.
+    func loadKeys(completion: @escaping @MainActor @Sendable () -> Void) {
+        keys.load([Keychain.anthropic, Keychain.openAI], completion: completion)
     }
 
-    func setAPIKey(_ key: String) -> Bool {
-        cachedKey = nil
-        return Keychain.save(key)
+    var apiKey: String? {
+        keys.key(Keychain.anthropic) ?? ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"]
+    }
+
+    func setAPIKey(_ key: String, completion: @escaping @MainActor @Sendable (Bool) -> Void) {
+        keys.save(key, Keychain.anthropic, completion: completion)
     }
 }

@@ -11,6 +11,9 @@ suggests edits on pause, and does hold-to-talk dictation (OpenAI GPT Transcribe 
   makes it menu-bar only. Release: `make release VERSION=x NOTES="..."` (release.sh, notary profile `AudioPin`).
 - Settings live in UserDefaults (domain `com.mattmoglia.typestro`); API keys in the keychain (service
   `com.mattmoglia.typestro`, accounts `anthropic-api-key` and `openai-api-key`).
+- Never call `Keychain` from the app's main thread; go through `KeyStore`. The key tap runs on the main thread, so a
+  keychain password prompt there freezes all typing, including in the prompt. Keys are read once in the background
+  at launch, and the tap doesn't start until that finishes.
 - Text fields are read and edited through Accessibility (FocusedField.swift). Web content (browsers, Electron apps)
   claims accessibility edits succeed without doing them, so edits there are typed as keystrokes (backspace + retype).
 - Prompts are in `Sources/TypestroCore/Prompts.swift`; `make probe` runs them on sample sentences.
