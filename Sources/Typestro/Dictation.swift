@@ -318,6 +318,11 @@ final class MicButton {
     private let dictation: Dictation
     private var panel: NSPanel?
     private var timer: Timer?
+    private var scrollMonitor: Any?
+    private var settle = ScrollSettle()
+    private var settleTimer: Timer?
+    /// The box the button is on, so settling only has to ask where it is, not reread its text.
+    private var field: FocusedField?
 
     init(settings: Settings, dictation: Dictation) {
         self.settings = settings
@@ -330,15 +335,48 @@ final class MicButton {
             timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.follow() }
             }
+            // Only watches scrolling go by, so it can't hold up typing or the scroll.
+            scrollMonitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                MainActor.assumeIsolated { self?.scrolled(event) }
+            }
             follow()
         } else if !settings.showMicButton {
             timer?.invalidate()
             timer = nil
+            if let scrollMonitor { NSEvent.removeMonitor(scrollMonitor) }
+            scrollMonitor = nil
+            stopSettling()
             panel?.orderOut(nil)
         }
     }
 
+    /// The page is moving under the button, so it gets out of the way straight away. Events with no
+    /// movement are a finger resting on the trackpad or a scroll ending.
+    private func scrolled(_ event: NSEvent) {
+        guard event.scrollingDeltaX != 0 || event.scrollingDeltaY != 0 else { return }
+        guard settle.isSettling || panel?.isVisible == true else { return }
+        settle.scrolled()
+        panel?.orderOut(nil)
+        guard settleTimer == nil else { return }
+        settleTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkSettled() }
+        }
+    }
+
+    private func checkSettled() {
+        guard settle.check(frame: field?.frame) else { return }
+        stopSettling()
+        follow()
+    }
+
+    private func stopSettling() {
+        settleTimer?.invalidate()
+        settleTimer = nil
+        settle = ScrollSettle()
+    }
+
     private func follow() {
+        guard !settle.isSettling else { return }
         guard settings.enabled, settings.dictationEnabled,
               let field = FocusedField.current(), !settings.isExcluded(field.bundleID),
               let frame = field.frame, frame.width > 60 else {
@@ -352,6 +390,7 @@ final class MicButton {
         let panel = self.panel ?? makePanel()
         self.panel = panel
         (panel.contentView as? MicButtonView)?.recording = dictation.isRecording
+        self.field = field
         panel.setFrame(rect, display: true)
         panel.orderFrontRegardless()
     }
