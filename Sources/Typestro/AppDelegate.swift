@@ -37,13 +37,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         installEditMenu()
         telemetry.onChange = { [weak self] in self?.updateButton() }
         telemetry.start()
-        startWhenPermitted(prompt: true)
         updateButton()
         if settings.handlesAutocorrect, settings.enabled { SystemAutocorrect.turnOff() }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+        // The key tap waits for this, so it can't be in the way if macOS asks for your keychain password.
+        settings.loadKeys { [weak self] in
             guard let self else { return }
-            if settings.apiKey == nil { askForAPIKey() }
-            offerAutocorrectTakeover()
+            startWhenPermitted(prompt: true)
+            updateButton()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self else { return }
+                if settings.apiKey == nil { askForAPIKey() }
+                offerAutocorrectTakeover()
+            }
         }
     }
 
@@ -194,7 +199,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             models.addItem(i)
         }
         menu.addItem(submenu("Claude Model", models))
-        menu.addItem(item(settings.apiKey == nil ? "Add Claude API Key…" : "Change Claude API Key…", #selector(askForAPIKey)))
+        let noClaudeKey = settings.keysLoaded && settings.apiKey == nil
+        menu.addItem(item(noClaudeKey ? "Add Claude API Key…" : "Change Claude API Key…", #selector(askForAPIKey)))
 
         menu.addItem(.separator())
         menu.addItem(submenu("Dictation", dictationMenu()))
@@ -262,8 +268,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(button)
 
         menu.addItem(.separator())
-        menu.addItem(item(settings.openAIKey == nil ? "Add OpenAI API Key…" : "Change OpenAI API Key…", #selector(askForOpenAIKey)))
-        if settings.openAIKey == nil {
+        let noOpenAIKey = settings.keysLoaded && settings.openAIKey == nil
+        menu.addItem(item(noOpenAIKey ? "Add OpenAI API Key…" : "Change OpenAI API Key…", #selector(askForOpenAIKey)))
+        if noOpenAIKey {
             menu.addItem(disabled("Dictation needs an OpenAI key"))
         }
         return menu
@@ -289,7 +296,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             title: "OpenAI API key",
             info: "Dictation sends your recording to OpenAI to turn it into text. Get a key at platform.openai.com. It's stored in your keychain.",
             placeholder: "sk-…") else { return }
-        if !settings.setOpenAIKey(key) { showKeychainError() }
+        settings.setOpenAIKey(key) { [weak self] saved in
+            if !saved { self?.showKeychainError() }
+        }
     }
 
     private func promptForKey(title: String, info: String, placeholder: String) -> String? {
@@ -315,6 +324,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func statusLine() -> String {
+        if !settings.keysLoaded { return "Waiting for your keychain" }
         if !isTrusted { return "Needs Accessibility permission" }
         if !settings.enabled { return "Paused" }
         if settings.apiKey == nil { return "Fixing typos only (no API key)" }
@@ -386,8 +396,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             and suggests improvements when you pause. Get a key at platform.claude.com. It's stored in your keychain.
             """,
             placeholder: "sk-ant-…") else { return }
-        if !settings.setAPIKey(key) { showKeychainError() }
-        updateButton()
+        settings.setAPIKey(key) { [weak self] saved in
+            if !saved { self?.showKeychainError() }
+            self?.updateButton()
+        }
     }
 
     @objc private func toggleLogin() {
