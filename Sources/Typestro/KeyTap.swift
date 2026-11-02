@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import TypestroCore
 
 enum KeyCode {
     static let tab: Int64 = 48
@@ -30,30 +31,30 @@ final class KeyTap {
 
     private var tap: CFMachPort?
     /// Keys pressed while Typestro is changing the text, sent on once it's done.
-    private var held: [CGEvent] = []
+    private var held = KeyHold<CGEvent>()
     private var holdGeneration = 0
-    private(set) var isHolding = false
+
+    /// Real keys that have arrived since `hold`.
+    var heldCount: Int { held.count }
 
     var isRunning: Bool { tap != nil }
 
     /// Holds back key presses until `release`, so they can't land in the middle of an edit (on a selected word,
-    /// say). Lets go by itself after a moment, in case an edit never finishes.
+    /// say). Lets go by itself after three seconds, in case an edit never finishes; an edit's own waits add up to
+    /// about one second, so this only ever catches a bug.
     func hold() {
-        isHolding = true
+        held.start()
         holdGeneration += 1
         let generation = holdGeneration
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
             if self?.holdGeneration == generation { self?.release() }
         }
     }
 
     /// Sends the held keys on, in order. They pass through the tap again, so they're handled like any other key.
     func release() {
-        guard isHolding else { return }
-        isHolding = false
-        let events = held
-        held = []
-        for event in events { event.post(tap: .cgSessionEventTap) }
+        guard held.isHolding else { return }
+        for event in held.finish() { event.post(tap: .cgSessionEventTap) }
     }
 
     func start() -> Bool {
@@ -87,8 +88,9 @@ final class KeyTap {
             return Unmanaged.passUnretained(event)
         }
         // Releases are held too, so the app never sees a key let go before it was pressed.
-        if isHolding, type == .keyDown || type == .keyUp {
-            if let copy = event.copy() { held.append(copy) }
+        if type == .keyDown || type == .keyUp, held.isHolding {
+            // A key that can't be kept is dropped: letting it through could type over the selected word.
+            if let copy = event.copy() { _ = held.offer(copy) }
             return nil
         }
         if type == .flagsChanged {

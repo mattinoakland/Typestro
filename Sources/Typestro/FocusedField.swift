@@ -135,15 +135,16 @@ struct FocusedField {
         return false
     }
 
-    /// Replaces just `range` with `new` and puts the cursor back where it was. Nothing else is touched,
-    /// and keys pressed meanwhile are held by `tap` and land after the edit, never inside it.
+    /// Replaces just `range` with `new` and puts the cursor back where it was. Nothing else is touched.
+    /// From selecting the word until the cursor is back, your keys are held by `tap` and replayed afterwards,
+    /// so they can never type over the selected word.
     @MainActor
     func replace(_ range: NSRange, with new: String, holding tap: KeyTap) async -> Bool {
         guard selection.length == 0, NSMaxRange(range) <= text.length else { return false }
         if !isWebContent, replaceDirectly(range, with: new) { return true }
         tap.hold()
         defer { tap.release() }
-        return await replaceBySelecting(range, with: new)
+        return await replaceBySelecting(range, with: new, tap: tap)
     }
 
     /// Native text views: set the text through accessibility, check it took, put the cursor back.
@@ -162,13 +163,17 @@ struct FocusedField {
     }
 
     /// Web content: select only the word, wait for the app to show the selection, type over it, then move the
-    /// cursor back. Never retypes what comes after it. If the app won't select the word, the edit is skipped.
+    /// cursor back. Never retypes what comes after it. The fix is called off, with the cursor put back, if you
+    /// press a key before the word is selected or the app won't select it.
     @MainActor
-    private func replaceBySelecting(_ range: NSRange, with new: String) async -> Bool {
+    private func replaceBySelecting(_ range: NSRange, with new: String, tap: KeyTap) async -> Bool {
         let caret = selection
-        guard setSelection(range), await waitFor({ currentSelection == range }) else {
-            setSelection(caret)
-            NSLog("Typestro: %@ wouldn't select the word, so it was left alone", appName)
+        // A key that reached the app just before the hold began has moved the cursor; this snapshot is stale.
+        guard tap.heldCount == 0, currentSelection == caret, setSelection(range) else { return false }
+        let selected = await waitFor({ tap.heldCount > 0 || currentSelection == range })
+        guard selected, tap.heldCount == 0 else {
+            await putBack(caret)
+            if tap.heldCount == 0 { NSLog("Typestro: %@ wouldn't select the word, so it was left alone", appName) }
             return false
         }
         KeyTap.type(new)
@@ -178,15 +183,22 @@ struct FocusedField {
                   value.substring(with: typed) == new else { return false }
             return currentSelection == NSRange(location: NSMaxRange(typed), length: 0)
         }, timeout: 0.4)
-        // If it didn't show up, or you clicked somewhere else meanwhile, the cursor stays where it is.
-        guard landed else { return false }
+        guard landed else {
+            // Still selected means nothing was typed: put the cursor back so your keys can't land on the word.
+            // Anything else (you clicked somewhere, say) is left as it is.
+            if currentSelection == range { await putBack(caret) }
+            return false
+        }
         var back = caret
         if back.location >= NSMaxRange(range) { back.location += typed.length - range.length }
-        if back != NSRange(location: NSMaxRange(typed), length: 0) {
-            setSelection(back)
-            _ = await waitFor({ currentSelection == back })
-        }
+        if back != NSRange(location: NSMaxRange(typed), length: 0) { await putBack(back) }
         return true
+    }
+
+    @MainActor
+    private func putBack(_ caret: NSRange) async {
+        setSelection(caret)
+        _ = await waitFor({ currentSelection == caret })
     }
 
     private var currentSelection: NSRange? { Self.copyRange(element, kAXSelectedTextRangeAttribute) }
