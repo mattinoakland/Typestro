@@ -8,6 +8,8 @@ public enum TextTools {
     private static let allowedBefore = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "([{\"“‘'—–"))
     private static let allowedAfter = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ".,!?;:)]}\"”’'…—–"))
     private static let sentenceEnds = CharacterSet(charactersIn: ".!?\n\r")
+    private static let terminators = CharacterSet(charactersIn: ".!?")
+    private static let closers = CharacterSet(charactersIn: "\"”’')]")
 
     static func scalar(_ c: unichar) -> Unicode.Scalar? { Unicode.Scalar(c) }
 
@@ -75,6 +77,58 @@ public enum TextTools {
         while i > 0, !isIn(sentenceEnds, text.character(at: i - 1)) { i -= 1 }
         while i < end, isIn(.whitespacesAndNewlines, text.character(at: i)) { i += 1 }
         return NSRange(location: i, length: end - i)
+    }
+
+    /// Where the finished part of the text ends: just after the last sentence before `caret` that you've
+    /// moved on from, meaning its . ! or ? is followed by a space, or it ends a line. 0 when there isn't one.
+    public static func finishedEnd(in text: NSString, caret: Int) -> Int {
+        var i = min(max(caret, 0), text.length)
+        while i > 0 {
+            let c = text.character(at: i - 1)
+            if isIn(.newlines, c) { return i }
+            if isIn(.whitespaces, c) {
+                var j = i - 2
+                while j >= 0, isIn(closers, text.character(at: j)) { j -= 1 }
+                if j >= 0, isIn(terminators, text.character(at: j)) { return i - 1 }
+            }
+            i -= 1
+        }
+        return 0
+    }
+
+    /// The part of a correction that actually changes, trimmed to whole words: "could of" → "could have"
+    /// is "of" → "have" at offset 6.
+    public struct Change: Equatable, Sendable {
+        /// Where `original` starts inside the full original text, in UTF-16.
+        public let offset: Int
+        public let original: String
+        public let replacement: String
+
+        /// One word swapped for one word (or two, as in "alot" → "a lot"): safe to make without asking.
+        /// Anything bigger changes how the sentence is put together.
+        public var isWordLevel: Bool {
+            !original.isEmpty && !replacement.isEmpty && original != replacement
+                && !original.contains(where: \.isWhitespace)
+                && !replacement.contains(where: \.isNewline)
+                && TextTools.wordCount(replacement) <= 2
+        }
+    }
+
+    public static func narrowChange(_ original: String, _ replacement: String) -> Change {
+        let a = original as NSString, b = replacement as NSString
+        var prefix = 0
+        while prefix < min(a.length, b.length), a.character(at: prefix) == b.character(at: prefix) { prefix += 1 }
+        // Keep only whole words: the shared start has to end with a space.
+        while prefix > 0, !isIn(.whitespaces, a.character(at: prefix - 1)) { prefix -= 1 }
+        var suffix = 0
+        let room = min(a.length, b.length) - prefix
+        while suffix < room, a.character(at: a.length - 1 - suffix) == b.character(at: b.length - 1 - suffix) { suffix += 1 }
+        // And the shared end has to start with one.
+        while suffix > 0, !isIn(.whitespaces, a.character(at: a.length - suffix)) { suffix -= 1 }
+        return Change(
+            offset: prefix,
+            original: a.substring(with: NSRange(location: prefix, length: a.length - prefix - suffix)),
+            replacement: b.substring(with: NSRange(location: prefix, length: b.length - prefix - suffix)))
     }
 
     /// A range of about `radius` characters either side of `location`, for long documents.

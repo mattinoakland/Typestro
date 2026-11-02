@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import TypestroCore
 
 enum KeyCode {
     static let tab: Int64 = 48
@@ -29,8 +30,32 @@ final class KeyTap {
     var modifierHandler: ((Int64, CGEventFlags) -> Void)?
 
     private var tap: CFMachPort?
+    /// Keys pressed while Typestro is changing the text, sent on once it's done.
+    private var held = KeyHold<CGEvent>()
+    private var holdGeneration = 0
+
+    /// Real keys that have arrived since `hold`.
+    var heldCount: Int { held.count }
 
     var isRunning: Bool { tap != nil }
+
+    /// Holds back key presses until `release`, so they can't land in the middle of an edit (on a selected word,
+    /// say). Lets go by itself after three seconds, in case an edit never finishes; an edit's own waits add up to
+    /// about one second, so this only ever catches a bug.
+    func hold() {
+        held.start()
+        holdGeneration += 1
+        let generation = holdGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            if self?.holdGeneration == generation { self?.release() }
+        }
+    }
+
+    /// Sends the held keys on, in order. They pass through the tap again, so they're handled like any other key.
+    func release() {
+        guard held.isHolding else { return }
+        for event in held.finish() { event.post(tap: .cgSessionEventTap) }
+    }
 
     func start() -> Bool {
         if tap != nil { return true }
@@ -42,7 +67,8 @@ final class KeyTap {
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
             options: .defaultTap,
-            eventsOfInterest: CGEventMask(1 << CGEventType.keyDown.rawValue) | CGEventMask(1 << CGEventType.flagsChanged.rawValue),
+            eventsOfInterest: CGEventMask(1 << CGEventType.keyDown.rawValue) | CGEventMask(1 << CGEventType.keyUp.rawValue)
+                | CGEventMask(1 << CGEventType.flagsChanged.rawValue),
             callback: callback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else { return false }
@@ -61,6 +87,12 @@ final class KeyTap {
         guard event.getIntegerValueField(.eventSourceUserData) != Self.marker else {
             return Unmanaged.passUnretained(event)
         }
+        // Releases are held too, so the app never sees a key let go before it was pressed.
+        if type == .keyDown || type == .keyUp, held.isHolding {
+            // A key that can't be kept is dropped: letting it through could type over the selected word.
+            if let copy = event.copy() { _ = held.offer(copy) }
+            return nil
+        }
         if type == .flagsChanged {
             modifierHandler?(event.getIntegerValueField(.keyboardEventKeycode), event.flags)
             return Unmanaged.passUnretained(event)
@@ -73,16 +105,6 @@ final class KeyTap {
         )
         if handler?(key) == true { return nil }
         return Unmanaged.passUnretained(event)
-    }
-
-    /// Presses Backspace `count` times.
-    static func backspace(_ count: Int) {
-        let source = CGEventSource(stateID: .privateState)
-        for _ in 0..<count {
-            for down in [true, false] {
-                if let event = CGEvent(keyboardEventSource: source, virtualKey: 51, keyDown: down) { post(event) }
-            }
-        }
     }
 
     /// Types text one character at a time, whatever the keyboard layout. Line breaks are typed as

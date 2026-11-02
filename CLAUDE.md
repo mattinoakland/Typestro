@@ -15,7 +15,12 @@ suggests edits on pause, and does hold-to-talk dictation (OpenAI GPT Transcribe 
   keychain password prompt there freezes all typing, including in the prompt. Keys are read once in the background
   at launch, and the tap doesn't start until that finishes.
 - Text fields are read and edited through Accessibility (FocusedField.swift). Web content (browsers, Electron apps)
-  claims accessibility edits succeed without doing them, so edits there are typed as keystrokes (backspace + retype).
+  claims accessibility edits succeed without doing them, so edits there select only the word, type over it and put
+  the cursor back. Never backspace-and-retype the text after a word: it erased whole lines and raced the user's
+  typing. While an edit runs, `KeyTap.hold()` keeps real key presses back and replays them afterwards.
+- Silent fixes are single words only (`TextTools.narrowChange(...).isWordLevel`), made after a 0.35 s pause.
+  Anything that changes a sentence's structure is only ever a suggestion, and only once that sentence is finished
+  (`TextTools.finishedEnd`).
 - Prompts are in `Sources/TypestroCore/Prompts.swift`; `make probe` runs them on sample sentences.
 - The update check and usage ping go to `https://mattmoglia.com/api/typestro` (served by the portfolio repo, like
   AudioPin's `/api/audiopin`).
