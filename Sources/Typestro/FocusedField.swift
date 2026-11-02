@@ -124,7 +124,7 @@ struct FocusedField {
 
     /// True for text inside web content: browsers and Electron apps (Claude, Slack, Discord).
     /// Those report accessibility edits as done without doing them, and apply selection
-    /// changes late, so edits there are typed as keystrokes instead.
+    /// changes late, so edits there select the text and type over it instead.
     var isWebContent: Bool {
         var current: AXUIElement? = element
         for _ in 0..<25 {
@@ -135,13 +135,15 @@ struct FocusedField {
         return false
     }
 
-    /// Replaces `range` with `new`.
-    ///
-    /// This runs on the main thread, which is also where the key tap lives, so keys the user
-    /// presses meanwhile wait in the tap and land after the edit.
-    func replace(_ range: NSRange, with new: String) -> Bool {
+    /// Replaces just `range` with `new` and puts the cursor back where it was. Nothing else is touched,
+    /// and keys pressed meanwhile are held by `tap` and land after the edit, never inside it.
+    @MainActor
+    func replace(_ range: NSRange, with new: String, holding tap: KeyTap) async -> Bool {
+        guard selection.length == 0, NSMaxRange(range) <= text.length else { return false }
         if !isWebContent, replaceDirectly(range, with: new) { return true }
-        return replaceByTyping(range, with: new)
+        tap.hold()
+        defer { tap.release() }
+        return await replaceBySelecting(range, with: new)
     }
 
     /// Native text views: set the text through accessibility, check it took, put the cursor back.
@@ -159,33 +161,43 @@ struct FocusedField {
         return true
     }
 
-    /// Web content. Near the cursor: backspace to the start of the word and retype it plus whatever
-    /// followed, the way text expanders do, so nothing is ever left selected. Further back (accepting
-    /// a suggestion while you're idle): select it, wait for the app to show the selection, type over it.
-    private func replaceByTyping(_ range: NSRange, with new: String) -> Bool {
-        let caret = selection.location
-        guard selection.length == 0 else { return false }
-        if range.location < caret, NSMaxRange(range) <= caret, caret - range.location <= 150 {
-            let tail = text.substring(with: NSRange(location: NSMaxRange(range), length: caret - NSMaxRange(range)))
-            // Retyping a Return could send a chat message.
-            guard !tail.contains(where: \.isNewline) else { return false }
-            let erase = text.substring(with: NSRange(location: range.location, length: caret - range.location)).count
-            KeyTap.backspace(erase)
-            KeyTap.type(new + tail)
-            return true
-        }
-        guard setSelection(range), waitFor({ Self.copyRange(element, kAXSelectedTextRangeAttribute) == range }) else {
+    /// Web content: select only the word, wait for the app to show the selection, type over it, then move the
+    /// cursor back. Never retypes what comes after it. If the app won't select the word, the edit is skipped.
+    @MainActor
+    private func replaceBySelecting(_ range: NSRange, with new: String) async -> Bool {
+        let caret = selection
+        guard setSelection(range), await waitFor({ currentSelection == range }) else {
+            setSelection(caret)
+            NSLog("Typestro: %@ wouldn't select the word, so it was left alone", appName)
             return false
         }
         KeyTap.type(new)
+        let typed = NSRange(location: range.location, length: (new as NSString).length)
+        let landed = await waitFor({
+            guard let value = Self.copyString(element, kAXValueAttribute) as NSString?, NSMaxRange(typed) <= value.length,
+                  value.substring(with: typed) == new else { return false }
+            return currentSelection == NSRange(location: NSMaxRange(typed), length: 0)
+        }, timeout: 0.4)
+        // If it didn't show up, or you clicked somewhere else meanwhile, the cursor stays where it is.
+        guard landed else { return false }
+        var back = caret
+        if back.location >= NSMaxRange(range) { back.location += typed.length - range.length }
+        if back != NSRange(location: NSMaxRange(typed), length: 0) {
+            setSelection(back)
+            _ = await waitFor({ currentSelection == back })
+        }
         return true
     }
 
-    private func waitFor(_ condition: () -> Bool, timeout: TimeInterval = 0.25) -> Bool {
+    private var currentSelection: NSRange? { Self.copyRange(element, kAXSelectedTextRangeAttribute) }
+
+    /// Checks every 10 ms without holding up the main thread, so the key tap keeps working.
+    @MainActor
+    private func waitFor(_ condition: () -> Bool, timeout: TimeInterval = 0.25) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if condition() { return true }
-            usleep(10_000)
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
         return condition()
     }

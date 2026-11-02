@@ -5,7 +5,7 @@ import ServiceManagement
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let settings = Settings()
-    private lazy var engine = Engine(settings: settings)
+    private lazy var engine = Engine(settings: settings, tap: tap)
     private lazy var dictation = Dictation(settings: settings)
     private lazy var micButton = MicButton(settings: settings, dictation: dictation)
     private let telemetry = Telemetry()

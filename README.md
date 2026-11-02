@@ -5,11 +5,13 @@ You write in your own words, and Typestro quietly makes them better.
 
 - **Silent fixes, by context.** Every time you finish a word, Claude reads the sentence you're in (and the one before)
   and fixes words that are misspelled or clearly not the word you meant: phonetic spellings ("sirkumstanses"),
-  sound-alikes (their/there, by/buy), and real words that don't fit ("piecing the right word"). The fix lands while
-  you keep typing, with a faint flash. Pausing checks the last word too, so messages without a period are covered.
+  sound-alikes (their/there, by/buy), and real words that don't fit ("piecing the right word"). Only single words are
+  fixed this way: once you pause, just that word is swapped and your cursor goes back where it was. Keys you press
+  during the swap wait and land right after it, and the fixed word flashes faintly. Anything bigger becomes a
+  suggestion. Pausing checks the last word too, so messages without a period are covered.
   There's no dictionary layer in front: Claude sees everything, so context decides.
 - **Suggestions when you pause.** After about 1.5 seconds without typing, Claude reads the whole field and may underline
-  up to three spots with a dotted line. Press **Tab** to see the nearest one, **Tab** again to accept, **Esc** to dismiss.
+  up to three spots with a dotted line, but only in sentences you've finished and moved on from. Press **Tab** to see the nearest one, **Tab** again to accept, **Esc** to dismiss.
 - **It learns.** Undo a fix and Typestro stops changing that word. Dismiss a suggestion and Claude is told to skip ones like it.
 - **Undo:** ⌃⌥Z undoes the latest fix, or pick one from **Recent Fixes** in the menu.
 - **Dictation.** Hold **Right Option**, talk, let go. OpenAI's GPT Transcribe turns it into text, Claude tidies it to fit

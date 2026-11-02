@@ -22,12 +22,14 @@ struct Suggestion {
 /// - Silent fixes: every time you finish a word, Claude reads the sentence you're in (and the one
 ///   before, for context) and fixes words that are misspelled or clearly not the word you meant.
 ///   One check runs at a time; if you typed more meanwhile, the next one starts with the newer text.
-///   Fixes Claude is certain of are applied in place; unsure ones are underlined.
-/// - Suggestions: when you pause, Claude reads the whole field and may underline a few spots.
-///   Tab shows the closest one, Tab again accepts, Esc dismisses.
+///   Only single words are fixed silently, one at a time, once you pause: just that word changes and
+///   the cursor goes back. Unsure fixes are underlined; bigger changes wait to be suggestions.
+/// - Suggestions: when you pause, Claude reads the whole field and may underline a few spots, but only
+///   in sentences you've moved on from. Tab shows the closest one, Tab again accepts, Esc dismisses.
 @MainActor
 final class Engine {
     private let settings: Settings
+    private let tap: KeyTap
     private let overlay = Overlay()
 
     private(set) var recentFixes: [Fix] = []
@@ -48,13 +50,19 @@ final class Engine {
     private var checkInFlight = false
     /// A check asked for while another was running; true if it should include the word at the cursor.
     private var queuedCheck: Bool?
+    /// Edits run one after another, never two at once.
+    private var editTask: Task<Void, Never>?
 
     private static let boundaries: Set<Character> = [" ", ",", ".", "!", "?", ";", ":", ")", "\"", "”", "\r", "\n"]
     private static let checkPauseDelay: TimeInterval = 0.7
     private static let pauseDelay: TimeInterval = 1.5
+    /// How long you have to stop typing before a fix is made. Long enough to be a real pause, not the gap
+    /// between two keys.
+    private static let editPause: TimeInterval = 0.35
 
-    init(settings: Settings) {
+    init(settings: Settings, tap: KeyTap) {
         self.settings = settings
+        self.tap = tap
     }
 
     // MARK: Keys
@@ -91,16 +99,25 @@ final class Engine {
 
     // MARK: Silent fixes
 
-    /// Runs `edit` once there's a short gap in typing, so a keystroke already on its way to the app
-    /// can't land in the middle of the edit. Gives up after about three seconds of nonstop typing.
-    private func whenTypingPauses(_ edit: @escaping () -> Void, attempts: Int = 60) {
-        if Date().timeIntervalSince(lastKeyTime) >= 0.08 {
-            edit()
-        } else if attempts > 0 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-                self?.whenTypingPauses(edit, attempts: attempts - 1)
-            }
+    /// Queues an edit behind any already running. With `afterPause`, it waits until you stop typing for a
+    /// moment, and is dropped after ten seconds of nonstop typing.
+    private func enqueueEdit(afterPause: Bool, _ edit: @escaping @MainActor (Engine) async -> Void) {
+        let previous = editTask
+        editTask = Task { [weak self] in
+            await previous?.value
+            guard let self else { return }
+            if afterPause, await !typingPaused() { return }
+            await edit(self)
         }
+    }
+
+    private func typingPaused() async -> Bool {
+        let deadline = Date().addingTimeInterval(10)
+        while Date().timeIntervalSince(lastKeyTime) < Self.editPause {
+            guard Date() < deadline else { return false }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return true
     }
 
     /// Asks Claude to check what you just typed: the sentence you're in and the one before it.
@@ -144,12 +161,14 @@ final class Engine {
                 for c in result.corrections {
                     let original = Prompts.stripMarks(c.original)
                     guard !original.isEmpty, original != c.replacement, !settings.isIgnored(original) else { continue }
-                    if c.certain {
-                        whenTypingPauses { [weak self] in
-                            self?.apply(original: original, replacement: c.replacement, in: element, near: focus.location)
+                    let change = TextTools.narrowChange(original, c.replacement)
+                    if c.certain, change.isWordLevel, !settings.isIgnored(change.original) {
+                        enqueueEdit(afterPause: true) { engine in
+                            await engine.apply(change, of: original, in: element, near: focus.location)
                         }
                     } else {
-                        unsure.append((original, c.replacement, "Did you mean this?"))
+                        // Bigger changes wait, in addSuggestions, until you've finished the sentence.
+                        unsure.append((original, c.replacement, change.isWordLevel ? "Did you mean this?" : "Fix this?"))
                     }
                 }
                 if !unsure.isEmpty { addSuggestions(unsure, fromReview: false, element: element, near: focus.location) }
@@ -160,22 +179,23 @@ final class Engine {
         }
     }
 
-    /// Fixes `original` behind the cursor, near where it was seen, and flashes the fixed word.
-    /// A word you've since kept typing into no longer matches as a whole word, so it's left alone.
+    /// Fixes the one word in `change`, found inside `original` behind the cursor near where it was seen, and
+    /// flashes it. A word you've since kept typing into no longer matches as a whole word, so it's left alone.
     @discardableResult
-    private func apply(original: String, replacement: String, in element: AXUIElement, near hint: Int) -> Bool {
+    private func apply(_ change: TextTools.Change, of original: String, in element: AXUIElement, near hint: Int) async -> Bool {
         guard let field = FocusedField.current(), CFEqual(field.element, element) else { return false }
         let caret = field.selection.location
         let lo = max(0, hint - 40)
         guard caret > lo,
-              let range = TextTools.locate(original, in: field.text, near: hint,
+              let whole = TextTools.locate(original, in: field.text, near: hint,
                                            within: NSRange(location: lo, length: caret - lo)) else { return false }
-        let fixed = TextTools.matchCase(of: original, to: replacement)
-        guard field.replace(range, with: fixed) else { return false }
+        let range = NSRange(location: whole.location + change.offset, length: (change.original as NSString).length)
+        let fixed = TextTools.matchCase(of: change.original, to: change.replacement)
+        guard await field.replace(range, with: fixed, holding: tap) else { return false }
         if let rect = field.screenRect(for: NSRange(location: range.location, length: (fixed as NSString).length)) {
             overlay.flash(rect)
         }
-        recentFixes.insert(Fix(original: original, replacement: fixed, location: range.location, element: element), at: 0)
+        recentFixes.insert(Fix(original: change.original, replacement: fixed, location: range.location, element: element), at: 0)
         if recentFixes.count > 15 { recentFixes.removeLast() }
         onChange?()
         return true
@@ -189,10 +209,12 @@ final class Engine {
     func undo(_ fix: Fix) {
         recentFixes.removeAll { $0.location == fix.location && $0.replacement == fix.replacement }
         settings.ignore(fix.original)
-        defer { onChange?() }
-        guard let field = FocusedField.current(), CFEqual(field.element, fix.element),
-              let range = TextTools.locate(fix.replacement, in: field.text, near: fix.location, within: nil) else { return }
-        _ = field.replace(range, with: fix.original)
+        onChange?()
+        enqueueEdit(afterPause: false) { engine in
+            guard let field = FocusedField.current(), CFEqual(field.element, fix.element),
+                  let range = TextTools.locate(fix.replacement, in: field.text, near: fix.location, within: nil) else { return }
+            _ = await field.replace(range, with: fix.original, holding: engine.tap)
+        }
     }
 
     // MARK: Suggestions
@@ -249,9 +271,14 @@ final class Engine {
         if fromReview { suggestions.removeAll { $0.fromReview } }
         hideCard()
         suggestionElement = element
+        // Anything beyond a single word waits until you've moved on from its sentence. It comes back from the
+        // next check or review once you have.
+        let finished = TextTools.finishedEnd(in: field.text, caret: field.selection.location)
         for (original, replacement, reason) in items {
             guard let range = TextTools.locate(original, in: field.text, near: hint, within: nil),
                   !suggestions.contains(where: { NSIntersectionRange($0.range, range).length > 0 }) else { continue }
+            let wordLevel = !fromReview && TextTools.narrowChange(original, replacement).isWordLevel
+            guard wordLevel || NSMaxRange(range) <= finished else { continue }
             suggestions.append(Suggestion(original: original, replacement: replacement, reason: reason,
                                           fromReview: fromReview, range: range))
         }
@@ -317,14 +344,18 @@ final class Engine {
 
     private func accept(_ index: Int) {
         hideCard()
-        guard suggestions.indices.contains(index), let field = FocusedField.current() else { return }
+        guard suggestions.indices.contains(index) else { return }
         let s = suggestions.remove(at: index)
-        if let range = TextTools.locate(s.original, in: field.text, near: s.range.location, within: nil),
-           field.replace(range, with: s.replacement),
-           let rect = field.screenRect(for: NSRange(location: range.location, length: (s.replacement as NSString).length)) {
-            overlay.flash(rect)
-        }
         follow()
+        enqueueEdit(afterPause: false) { engine in
+            guard let field = FocusedField.current(),
+                  let range = TextTools.locate(s.original, in: field.text, near: s.range.location, within: nil) else { return }
+            if await field.replace(range, with: s.replacement, holding: engine.tap),
+               let rect = field.screenRect(for: NSRange(location: range.location, length: (s.replacement as NSString).length)) {
+                engine.overlay.flash(rect)
+            }
+            engine.follow()
+        }
     }
 
     private func dismiss(_ index: Int) {
