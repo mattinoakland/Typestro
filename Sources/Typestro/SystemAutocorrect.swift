@@ -1,8 +1,14 @@
 import Foundation
 
 /// macOS's own typing helpers (autocorrect, auto-capitalization, inline predictions), which change
-/// words before Typestro sees them. Switched off while Typestro does the fixing, and put back exactly
-/// as they were when it stops. Apps already open may keep the old behavior until reopened.
+/// words before Typestro sees them, and its red spelling underlines, which would sit on top of Typestro's
+/// own. Switched off while Typestro runs, and put back exactly as they were when it stops. Apps already
+/// open may keep the old behavior until reopened. Chrome and Electron apps have their own spell-check
+/// setting and ignore all of these.
+///
+/// The spelling-underline keys were checked in a test process: with `NSAllowContinuousSpellChecking`
+/// off, a text view can't turn continuous spell-checking on; `WebContinuousSpellCheckingEnabled` is where
+/// older WebKit views (Mail's compose window) start out.
 @MainActor
 enum SystemAutocorrect {
     private static let keys = [
@@ -10,6 +16,9 @@ enum SystemAutocorrect {
         "WebAutomaticSpellingCorrectionEnabled",
         "NSAutomaticCapitalizationEnabled",
         "NSAutomaticInlinePredictionEnabled",
+        // Red spelling underlines: Cocoa text views (Notes, TextEdit, Messages), then WebKit.
+        "NSAllowContinuousSpellChecking",
+        "WebContinuousSpellCheckingEnabled",
     ]
     private static let capitalizationKey = "NSAutomaticCapitalizationEnabled"
     /// The user's own values, saved before Typestro first changes them. Survives a crash.
@@ -38,11 +47,11 @@ enum SystemAutocorrect {
 
     static func turnOff() {
         let defaults = UserDefaults.standard
-        if defaults.dictionary(forKey: savedKey) == nil {
-            var saved: [String: Any] = [:]
-            for key in keys { saved[key] = read(key).map { $0 as Any } ?? unset }
-            defaults.set(saved, forKey: savedKey)
-        }
+        // Saved once. A copy saved by an older version lacks newer keys, so those get their originals added
+        // now, before they're changed, instead of being reset to the default on restore.
+        var saved = defaults.dictionary(forKey: savedKey) ?? [:]
+        for key in keys where saved[key] == nil { saved[key] = read(key).map { $0 as Any } ?? unset }
+        defaults.set(saved, forKey: savedKey)
         for key in keys { write(key, false) }
         sync()
     }

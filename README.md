@@ -28,9 +28,11 @@ what could be better, and you decide.
   **Dictation** in the menu. Needs an OpenAI API key and microphone access.
 
 Typestro never touches password fields, and it's off by default in terminals, code editors and password managers.
-You can turn it off per app from the menu. It can also switch off macOS's own autocorrect, capitalization and
-predictive text while it runs (it asks first, and puts them back when you pause or quit it); then Claude handles
-capitalization too.
+You can turn it off per app from the menu. It can also switch off macOS's own autocorrect, capitalization,
+predictive text and red spelling underlines while it runs (it asks first, and puts them back when you pause or quit
+it); then Claude handles capitalization too. Apps already open may need reopening. Chrome and apps built on it
+(Slack, Discord, Claude) keep their own spell-check setting under **Edit → Spelling and Grammar**, which Typestro
+leaves alone.
 
 - macOS 14 or later, Apple Silicon or Intel.
 - Menu bar only (no Dock icon). Optional launch at login.

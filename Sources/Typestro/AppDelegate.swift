@@ -91,8 +91,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.messageText = "Let Typestro handle autocorrect?"
         alert.informativeText = """
         macOS's own autocorrect, capitalization and predictive text change words before Typestro sees them, \
-        and they don't read the sentence. Typestro can switch them off while it's running and put them back \
-        exactly as they were when you pause or quit it. Apps that are already open may need to be reopened.
+        and its red spelling underlines sit on top of Typestro's own. Typestro can switch them all off while it's \
+        running and put them back exactly as they were when you pause or quit it. Apps that are already open may \
+        need to be reopened. Chrome and apps built on it keep their own spell-check setting, under Edit → \
+        Spelling and Grammar.
         """
         alert.addButton(withTitle: "Turn Them Off")
         alert.addButton(withTitle: "Keep macOS Autocorrect")
@@ -177,7 +179,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let takeover = item("Let Typestro Handle Autocorrect", #selector(toggleAutocorrectTakeover))
         takeover.state = settings.handlesAutocorrect ? .on : .off
-        takeover.toolTip = "Turns off macOS's own autocorrect, capitalization and predictive text while Typestro runs"
+        takeover.toolTip = "Turns off macOS's own autocorrect, capitalization, predictive text and red spelling underlines while Typestro runs"
         menu.addItem(takeover)
 
         if let app = menuTargetApp, let id = app.bundleIdentifier, id != Bundle.main.bundleIdentifier {
