@@ -62,7 +62,7 @@ final class TextToolsTests: XCTestCase {
     }
 
     func testSchemasAreValidJSON() throws {
-        XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: Prompts.spellingSchema))
-        XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: Prompts.suggestionSchema))
+        XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: Prompts.reviewSchema))
+        XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: Prompts.dictationSchema))
     }
 }

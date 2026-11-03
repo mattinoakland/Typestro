@@ -28,11 +28,11 @@ final class KeyHoldTests: XCTestCase {
         XCTAssertEqual(hold.finish(), [], "nothing is replayed twice")
     }
 
-    func testCountTellsAnEditToStandDown() {
+    func testCountsWhatIsHeld() {
         var hold = KeyHold<String>()
         hold.start()
-        XCTAssertEqual(hold.count, 0, "no key yet: go ahead and select the word")
+        XCTAssertEqual(hold.count, 0)
         _ = hold.offer("x")
-        XCTAssertEqual(hold.count, 1, "a key came first: call the fix off")
+        XCTAssertEqual(hold.count, 1)
     }
 }

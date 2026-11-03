@@ -6,6 +6,9 @@ enum KeyCode {
     static let tab: Int64 = 48
     static let escape: Int64 = 53
     static let z: Int64 = 6
+    static let a: Int64 = 0
+    static let left: Int64 = 123
+    static let right: Int64 = 124
 }
 
 /// Sees every key press system-wide before the app in front gets it, and can swallow one
@@ -32,28 +35,33 @@ final class KeyTap {
     private var tap: CFMachPort?
     /// Keys pressed while Typestro is changing the text, sent on once it's done.
     private var held = KeyHold<CGEvent>()
+    private var holdDepth = 0
     private var holdGeneration = 0
-
-    /// Real keys that have arrived since `hold`.
-    var heldCount: Int { held.count }
 
     var isRunning: Bool { tap != nil }
 
-    /// Holds back key presses until `release`, so they can't land in the middle of an edit (on a selected word,
-    /// say). Lets go by itself after three seconds, in case an edit never finishes; an edit's own waits add up to
-    /// about one second, so this only ever catches a bug.
+    /// Holds back key presses until the matching `release`, so they can't land in the middle of an edit (on a
+    /// selected word, say). Holds nest: accepting several suggestions holds for the whole batch, and each word's
+    /// edit inside it holds too. Lets go by itself three seconds after the last `hold`, in case an edit never
+    /// finishes; one word's edit waits about one second at most, so this only ever catches a bug.
     func hold() {
-        held.start()
+        holdDepth += 1
+        if holdDepth == 1 { held.start() }
         holdGeneration += 1
         let generation = holdGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            if self?.holdGeneration == generation { self?.release() }
+            guard let self, holdGeneration == generation, held.isHolding else { return }
+            holdDepth = 1
+            release()
         }
     }
 
-    /// Sends the held keys on, in order. They pass through the tap again, so they're handled like any other key.
+    /// Once the outermost hold ends, sends the held keys on, in order. They pass through the tap again, so
+    /// they're handled like any other key.
     func release() {
-        guard held.isHolding else { return }
+        guard holdDepth > 0 else { return }
+        holdDepth -= 1
+        guard holdDepth == 0 else { return }
         for event in held.finish() { event.post(tap: .cgSessionEventTap) }
     }
 

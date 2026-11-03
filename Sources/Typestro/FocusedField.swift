@@ -144,7 +144,7 @@ struct FocusedField {
         if !isWebContent, replaceDirectly(range, with: new) { return true }
         tap.hold()
         defer { tap.release() }
-        return await replaceBySelecting(range, with: new, tap: tap)
+        return await replaceBySelecting(range, with: new)
     }
 
     /// Native text views: set the text through accessibility, check it took, put the cursor back.
@@ -162,18 +162,17 @@ struct FocusedField {
         return true
     }
 
-    /// Web content: select only the word, wait for the app to show the selection, type over it, then move the
-    /// cursor back. Never retypes what comes after it. The fix is called off, with the cursor put back, if you
-    /// press a key before the word is selected or the app won't select it.
+    /// Web content: select only the text, wait for the app to show the selection, type over it, then move the
+    /// cursor back. Never retypes what comes after it. If the app won't select it, the cursor goes back and the
+    /// edit is skipped.
     @MainActor
-    private func replaceBySelecting(_ range: NSRange, with new: String, tap: KeyTap) async -> Bool {
+    private func replaceBySelecting(_ range: NSRange, with new: String) async -> Bool {
         let caret = selection
         // A key that reached the app just before the hold began has moved the cursor; this snapshot is stale.
-        guard tap.heldCount == 0, currentSelection == caret, setSelection(range) else { return false }
-        let selected = await waitFor({ tap.heldCount > 0 || currentSelection == range })
-        guard selected, tap.heldCount == 0 else {
+        guard currentSelection == caret, setSelection(range) else { return false }
+        guard await waitFor({ currentSelection == range }) else {
             await putBack(caret)
-            if tap.heldCount == 0 { NSLog("Typestro: %@ wouldn't select the word, so it was left alone", appName) }
+            NSLog("Typestro: %@ wouldn't select the text, so it was left alone", appName)
             return false
         }
         KeyTap.type(new)
