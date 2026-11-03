@@ -1,28 +1,38 @@
 # Typestro
 
-A menu-bar app that makes your typing better in any Mac app, without you asking it to.
-You write in your own words, and Typestro quietly makes them better.
+A menu-bar app that helps you write better in any Mac app. It never changes what you type on its own: it underlines
+what could be better, and you decide.
 
-- **Silent fixes, by context.** Every time you finish a word, Claude reads the sentence you're in (and the one before)
-  and fixes words that are misspelled or clearly not the word you meant: phonetic spellings ("sirkumstanses"),
-  sound-alikes (their/there, by/buy), and real words that don't fit ("piecing the right word"). Only single words are
-  fixed this way: once you pause, just that word is swapped and your cursor goes back where it was. Keys you press
-  during the swap wait and land right after it, and the fixed word flashes faintly. Anything bigger becomes a
-  suggestion. Pausing checks the last word too, so messages without a period are covered.
-  There's no dictionary layer in front: Claude sees everything, so context decides.
-- **Suggestions when you pause.** After about 1.5 seconds without typing, Claude reads the whole field and may underline
-  up to three spots with a dotted line, but only in sentences you've finished and moved on from. Press **Tab** to see the nearest one, **Tab** again to accept, **Esc** to dismiss.
-- **It learns.** Undo a fix and Typestro stops changing that word. Dismiss a suggestion and Claude is told to skip ones like it.
-- **Undo:** ⌃⌥Z undoes the latest fix, or pick one from **Recent Fixes** in the menu.
+- **Underlines, by context.** When you pause, or soon after you finish a sentence, Claude reads what you've written and
+  underlines it in Typestro's own violet, distinct from the app's spellcheck:
+  - a **wave** under a misspelled or wrong word: phonetic spellings ("sirkumstanses"), sound-alikes (their/there,
+    by/buy), and real words that don't fit ("piecing the right word");
+  - a **dashed line** under a sentence that could read better (Medium and Full). These only appear once you've
+    finished the sentence and moved on.
+- **Three levels**, under **Suggestions** in the menu. **Light**: spelling and wrong words. **Medium**: adds grammar and
+  clarity. **Full**: adds tightening and flow.
+- **Preview before you accept.** Hover over or click an underline for a small card showing the change: removed words
+  struck through, new words highlighted. **Accept** or **Skip**, and step through alternatives when Claude offers more
+  than one. From the keyboard, **Tab** opens the nearest card, **Tab** again accepts, **Esc** skips, **← →** step
+  through alternatives.
+- **Accept all, undo all.** **⌃⌥A** accepts every suggestion showing in one go. **⌃⌥Z** undoes the last accept,
+  a whole batch at once. Before changing anything Typestro re-reads the text, and skips any suggestion whose words
+  have changed since. While it edits, keys you press wait and land right after.
+- **Where an app won't say where its words are**, the suggestions appear as a small list by the text box instead of
+  underlines. Underlines hide while you scroll and come back once the page stops.
+- **It learns.** Skip a word suggestion and Typestro stops flagging that word. Skip any suggestion and Claude is told
+  to skip ones like it.
 - **Dictation.** Hold **Right Option**, talk, let go. OpenAI's GPT Transcribe turns it into text, Claude tidies it to fit
   what's already in the box (punctuation, filler words, "no wait, I mean…"), and it's typed at your cursor. Esc cancels.
   No text box focused? It goes to the clipboard. The hotkey and an optional mic button inside text boxes are under
   **Dictation** in the menu. Needs an OpenAI API key and microphone access.
 
 Typestro never touches password fields, and it's off by default in terminals, code editors and password managers.
-You can turn it off per app from the menu. It can also switch off macOS's own autocorrect, capitalization and
-predictive text while it runs (it asks first, and puts them back when you pause or quit it); then Claude handles
-capitalization too.
+You can turn it off per app from the menu. It can also switch off macOS's own autocorrect, capitalization,
+predictive text and red spelling underlines while it runs (it asks first, and puts them back when you pause or quit
+it); then Claude handles capitalization too. Apps already open may need reopening. Chrome and apps built on it
+(Slack, Discord, Claude) keep their own spell-check setting under **Edit → Spelling and Grammar**, which Typestro
+leaves alone.
 
 - macOS 14 or later, Apple Silicon or Intel.
 - Menu bar only (no Dock icon). Optional launch at login.
@@ -57,20 +67,20 @@ make install
 
 This copies it to `/Applications` and launches it from there. Launch at login works most reliably from `/Applications`.
 
-Other targets: `make stop`, `make uninstall`, `make clean`, `make test`, `make probe` (runs the prompts on sample
-sentences and prints what Claude changes, with timings), `make logs`, `make dist` (a zip to hand someone).
+Other targets: `make stop`, `make uninstall`, `make clean`, `make test`, `make probe` (runs the review prompt on sample
+text at each level and prints what Claude would underline, with timings), `make logs`, `make dist` (a zip to hand someone).
 
 ## Menu
 
-Pause, Suggestions intensity (Light / Medium / Full), Let Typestro Handle Autocorrect, Recent Fixes, turn off in the
-current app, Claude model (Haiku 5.5 default, for speed and cost), Claude API key, Dictation (hotkey, mic button,
+Pause (turns off suggestions and dictation), Suggestions (Suggest While Typing on or off, which keeps dictation working;
+Light / Medium / Full; Accept All; Undo Last Accept), Let Typestro Handle Autocorrect, turn off in the current app, Claude model (Haiku 5.5 default, for speed and cost), Claude API key, Dictation (hotkey, mic button,
 OpenAI API key), Open at Login, Forget Learned Preferences, Send Anonymous Usage Stats, Send Feedback, Website,
 Buy Me a Coffee. When a newer version is out, a download link appears at the top.
 
 ## Privacy
 
-As you type, the sentence you're in plus a few hundred characters before it are sent to the Claude API (Anthropic),
-along with the app's name. Suggestions send up to a few thousand characters around your cursor. Without a Claude key,
+When you pause or finish a sentence, up to a few thousand characters around your cursor are sent to the Claude API
+(Anthropic), along with the app's name, and only if the text has changed since the last check. Without a Claude key,
 Typestro does nothing.
 
 Dictation records only while the key is held (or until you click the mic again), sends the audio to OpenAI, and

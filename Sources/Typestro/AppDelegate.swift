@@ -91,8 +91,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.messageText = "Let Typestro handle autocorrect?"
         alert.informativeText = """
         macOS's own autocorrect, capitalization and predictive text change words before Typestro sees them, \
-        and they don't read the sentence. Typestro can switch them off while it's running and put them back \
-        exactly as they were when you pause or quit it. Apps that are already open may need to be reopened.
+        and its red spelling underlines sit on top of Typestro's own. Typestro can switch them all off while it's \
+        running and put them back exactly as they were when you pause or quit it. Apps that are already open may \
+        need to be reopened. Chrome and apps built on it keep their own spell-check setting, under Edit → \
+        Spelling and Grammar.
         """
         alert.addButton(withTitle: "Turn Them Off")
         alert.addButton(withTitle: "Keep macOS Autocorrect")
@@ -154,34 +156,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(item(settings.enabled ? "Pause Typestro" : "Turn Typestro On", #selector(toggleEnabled)))
 
-        let intensity = NSMenu()
+        let suggest = NSMenu()
+        let typing = item("Suggest While Typing", #selector(toggleSuggestions))
+        typing.state = settings.suggestionsEnabled ? .on : .off
+        typing.toolTip = "Off keeps dictation working. Pause Typestro turns off both."
+        suggest.addItem(typing)
+        suggest.addItem(.separator())
         for level in Intensity.allCases {
             let i = item(level.title, #selector(setIntensity(_:)))
             i.representedObject = level.rawValue
             i.state = settings.intensity == level ? .on : .off
-            intensity.addItem(i)
+            suggest.addItem(i)
         }
-        menu.addItem(submenu("Suggestions", intensity))
+        suggest.addItem(.separator())
+        let count = engine.suggestions.count
+        suggest.addItem(count > 0 ? item("Accept All \(count) Suggestions  ⌃⌥A", #selector(acceptAll))
+                                  : disabled("Accept All Suggestions  ⌃⌥A"))
+        suggest.addItem(engine.canUndo ? item("Undo Last Accept  ⌃⌥Z", #selector(undoAccept))
+                                       : disabled("Undo Last Accept  ⌃⌥Z"))
+        suggest.addItem(disabled("Hover over an underline, or press Tab, to see it."))
+        menu.addItem(submenu("Suggestions", suggest))
 
         let takeover = item("Let Typestro Handle Autocorrect", #selector(toggleAutocorrectTakeover))
         takeover.state = settings.handlesAutocorrect ? .on : .off
-        takeover.toolTip = "Turns off macOS's own autocorrect, capitalization and predictive text while Typestro runs"
+        takeover.toolTip = "Turns off macOS's own autocorrect, capitalization, predictive text and red spelling underlines while Typestro runs"
         menu.addItem(takeover)
-
-        let fixes = NSMenu()
-        if engine.recentFixes.isEmpty {
-            fixes.addItem(disabled("No fixes yet"))
-        } else {
-            for (index, fix) in engine.recentFixes.enumerated() {
-                let i = item("\(fix.original) → \(fix.replacement)", #selector(undoFix(_:)))
-                i.tag = index
-                i.toolTip = "Undo this fix and stop changing \"\(fix.original)\""
-                fixes.addItem(i)
-            }
-            fixes.addItem(.separator())
-            fixes.addItem(disabled("Click one to undo it. ⌃⌥Z undoes the latest."))
-        }
-        menu.addItem(submenu("Recent Fixes", fixes))
 
         if let app = menuTargetApp, let id = app.bundleIdentifier, id != Bundle.main.bundleIdentifier {
             let name = app.localizedName ?? id
@@ -327,8 +326,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !settings.keysLoaded { return "Waiting for your keychain" }
         if !isTrusted { return "Needs Accessibility permission" }
         if !settings.enabled { return "Paused" }
-        if settings.apiKey == nil { return "Fixing typos only (no API key)" }
-        return "Watching as you type"
+        if !settings.suggestionsEnabled { return "Dictation only (suggestions off)" }
+        if settings.apiKey == nil { return "Add a Claude API key for suggestions" }
+        return "Suggesting as you write"
     }
 
     private func item(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
@@ -369,17 +369,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func setIntensity(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let level = Intensity(rawValue: raw) else { return }
         settings.intensity = level
-        if level == .light { engine.clearSuggestions() }
+        engine.clearSuggestions()
+    }
+
+    @objc private func toggleSuggestions() {
+        settings.suggestionsEnabled.toggle()
+        engine.clearSuggestions()
+    }
+
+    @objc private func acceptAll() {
+        engine.acceptAll()
+    }
+
+    @objc private func undoAccept() {
+        engine.undoLast()
     }
 
     @objc private func setModel(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         settings.model = id
-    }
-
-    @objc private func undoFix(_ sender: NSMenuItem) {
-        guard engine.recentFixes.indices.contains(sender.tag) else { return }
-        engine.undo(engine.recentFixes[sender.tag])
     }
 
     @objc private func toggleCurrentApp() {

@@ -6,7 +6,7 @@ public struct KeyHold<Event> {
 
     public init() {}
 
-    /// Keys that have arrived since `start`. Any at all before the word is selected means the fix is called off.
+    /// Keys that have arrived since `start`.
     public var count: Int { events.count }
 
     public mutating func start() {

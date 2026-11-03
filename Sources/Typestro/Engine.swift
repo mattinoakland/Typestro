@@ -1,263 +1,151 @@
 import AppKit
 import TypestroCore
 
-struct Fix {
-    let original: String
-    let replacement: String
-    let location: Int
-    let element: AXUIElement
-}
-
 struct Suggestion {
+    let kind: SuggestionKind
     let original: String
-    let replacement: String
+    /// What it could become, best first. Usually one.
+    let options: [String]
     let reason: String
-    /// From the pause review (replaced on each new review), as opposed to an unsure spelling fix.
-    let fromReview: Bool
     var range: NSRange
+    var choice = 0
+
+    var replacement: String { options[choice] }
 }
 
-/// Decides what to fix and suggest, and when.
+/// Reads what you write and underlines what could be better. It never changes your text on its own: a
+/// suggestion is only applied when you accept it.
 ///
-/// - Silent fixes: every time you finish a word, Claude reads the sentence you're in (and the one
-///   before, for context) and fixes words that are misspelled or clearly not the word you meant.
-///   One check runs at a time; if you typed more meanwhile, the next one starts with the newer text.
-///   Only single words are fixed silently, one at a time, once you pause: just that word changes and
-///   the cursor goes back. Unsure fixes are underlined; bigger changes wait to be suggestions.
-/// - Suggestions: when you pause, Claude reads the whole field and may underline a few spots, but only
-///   in sentences you've moved on from. Tab shows the closest one, Tab again accepts, Esc dismisses.
+/// - Checks run when you pause, or soon after you finish a sentence, and only when the text has changed.
+///   One request reads the text around the cursor and returns both kinds of underline: a wave under a
+///   misspelled or wrong word, a dashed line under a sentence that could read better (Medium and Full).
+///   Sentence suggestions only appear once you've moved on from that sentence.
+/// - Hover over or click an underline for a card showing the change. Tab opens the nearest one from the
+///   keyboard; Tab again accepts, Esc skips, ← → step through alternatives. ⌃⌥A accepts every suggestion
+///   showing, ⌃⌥Z undoes the last accept (a whole batch at once).
+/// - Accepting re-reads the field and skips anything whose text no longer matches exactly. While it edits,
+///   your key presses are held and replayed afterwards.
 @MainActor
 final class Engine {
     private let settings: Settings
     private let tap: KeyTap
     private let overlay = Overlay()
 
-    private(set) var recentFixes: [Fix] = []
     private(set) var suggestions: [Suggestion] = []
     private(set) var lastError: String?
     var onChange: (() -> Void)?
 
-    private var suggestionElement: AXUIElement?
-    private var cardIndex: Int?
+    /// The field the suggestions belong to.
+    private var element: AXUIElement?
+    /// The last snapshot of that field, for its position while scrolling settles.
+    private var lastField: FocusedField?
+    /// Where each suggestion's underline is on screen, by index. Empty when the app won't say.
+    private var rects: [[NSRect]] = []
+
     private var pauseTimer: Timer?
     private var followTimer: Timer?
     private var followPending = false
-    private var lastReviewedText: String?
-    private var reviewTask: Task<Void, Never>?
     private var lastKeyTime = Date.distantPast
-    private var checkPauseTimer: Timer?
     private var lastChecked: String?
-    private var checkInFlight = false
-    /// A check asked for while another was running; true if it should include the word at the cursor.
-    private var queuedCheck: Bool?
+    private var checkTask: Task<Void, Never>?
     /// Edits run one after another, never two at once.
     private var editTask: Task<Void, Never>?
+    private var undoStack: [(element: AXUIElement, edits: [PlannedEdit])] = []
 
-    private static let boundaries: Set<Character> = [" ", ",", ".", "!", "?", ";", ":", ")", "\"", "”", "\r", "\n"]
-    private static let checkPauseDelay: TimeInterval = 0.7
-    private static let pauseDelay: TimeInterval = 1.5
-    /// How long you have to stop typing before a fix is made. Long enough to be a real pause, not the gap
-    /// between two keys.
-    private static let editPause: TimeInterval = 0.35
+    private var cardIndex: Int?
+    private var cardFromKeyboard = false
+    private var hoverWork: DispatchWorkItem?
+    private var mouseMonitor: Any?
+    private var scrollMonitor: Any?
+    private var settle = ScrollSettle()
+    private var settleTimer: Timer?
+
+    private static let pauseDelay: TimeInterval = 1.2
+    /// After . ! ? or Return: soon, but not so soon that "e.g." or a quick next word sets it off.
+    private static let sentenceDelay: TimeInterval = 0.5
+    private static let sentenceEnds: Set<Character> = [".", "!", "?", "\r", "\n"]
 
     init(settings: Settings, tap: KeyTap) {
         self.settings = settings
         self.tap = tap
     }
 
+    var canUndo: Bool { !undoStack.isEmpty }
+
+    private var isActive: Bool {
+        settings.enabled && settings.suggestionsEnabled
+            && !settings.isExcluded(NSWorkspace.shared.frontmostApplication?.bundleIdentifier)
+    }
+
     // MARK: Keys
 
     /// Called for every key press before it reaches the app. Returns true to swallow the key.
     func handleKey(_ key: KeyTap.Key) -> Bool {
-        guard settings.enabled, !settings.isExcluded(NSWorkspace.shared.frontmostApplication?.bundleIdentifier) else {
+        guard isActive else {
             if !suggestions.isEmpty { clearSuggestions() }
             return false
         }
         lastKeyTime = Date()
-        if let index = cardIndex {
-            if key.keyCode == KeyCode.tab, key.isPlain { accept(index); return true }
-            if key.keyCode == KeyCode.escape { dismiss(index); return true }
-            hideCard()
-        } else if key.keyCode == KeyCode.tab, key.isPlain, !suggestions.isEmpty, showCard() {
+        let controlOption = key.flags.contains(.maskControl) && key.flags.contains(.maskAlternate)
+        if controlOption, key.keyCode == KeyCode.a {
+            acceptAll()
             return true
         }
-        if key.keyCode == KeyCode.z, key.flags.contains(.maskControl), key.flags.contains(.maskAlternate) {
-            undoLastFix()
+        if controlOption, key.keyCode == KeyCode.z {
+            undoLast()
             return true
         }
+        if let index = cardIndex, cardFromKeyboard, suggestions.indices.contains(index) {
+            switch key.keyCode {
+            case KeyCode.tab where key.isPlain: accept([index]); return true
+            case KeyCode.escape: skip(index); return true
+            case KeyCode.right where suggestions[index].options.count > 1: cycle(index, by: 1); return true
+            case KeyCode.left where suggestions[index].options.count > 1: cycle(index, by: -1); return true
+            default: break
+            }
+        } else if key.keyCode == KeyCode.tab, key.isPlain, !suggestions.isEmpty, showNearestCard() {
+            return true
+        }
+        hideCard()
         scheduleFollow()
         guard !key.flags.contains(.maskCommand), !key.flags.contains(.maskControl) else { return false }
-        restartPauseTimer()
-        if let c = key.characters.last, Self.boundaries.contains(c) {
-            // Let the keystroke land in the app before reading the field.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-                self?.requestCheck(includingWordAtCursor: false)
-            }
-        }
+        let endsSentence = key.characters.last.map { Self.sentenceEnds.contains($0) } ?? false
+        restartPauseTimer(endsSentence ? Self.sentenceDelay : Self.pauseDelay)
         return false
     }
 
-    // MARK: Silent fixes
-
-    /// Queues an edit behind any already running. With `afterPause`, it waits until you stop typing for a
-    /// moment, and is dropped after ten seconds of nonstop typing.
-    private func enqueueEdit(afterPause: Bool, _ edit: @escaping @MainActor (Engine) async -> Void) {
-        let previous = editTask
-        editTask = Task { [weak self] in
-            await previous?.value
-            guard let self else { return }
-            if afterPause, await !typingPaused() { return }
-            await edit(self)
-        }
-    }
-
-    private func typingPaused() async -> Bool {
-        let deadline = Date().addingTimeInterval(10)
-        while Date().timeIntervalSince(lastKeyTime) < Self.editPause {
-            guard Date() < deadline else { return false }
-            try? await Task.sleep(nanoseconds: 50_000_000)
-        }
-        return true
-    }
-
-    /// Asks Claude to check what you just typed: the sentence you're in and the one before it.
-    /// After a finished word the word you're starting is left out; after a pause it's included,
-    /// so the end of a message with no period still gets checked.
-    private func requestCheck(includingWordAtCursor: Bool) {
-        if checkInFlight {
-            queuedCheck = (queuedCheck ?? false) || includingWordAtCursor
-            return
-        }
-        guard settings.enabled, let field = FocusedField.current(), field.selection.length == 0,
-              !settings.isExcluded(field.bundleID) else { return }
-        let caret = field.selection.location
-        let end = includingWordAtCursor ? caret : TextTools.startOfWordInProgress(in: field.text, caret: caret)
-        let current = TextTools.sentenceRange(in: field.text, endingAt: end)
-        let previous = TextTools.sentenceRange(in: field.text, endingAt: current.location)
-        let focus = NSRange(location: previous.location, length: end - previous.location)
-        let text = field.text.substring(with: focus)
-        guard TextTools.wordCount(text) >= 2, text != lastChecked, let client = makeClient() else { return }
-        lastChecked = text
-
-        let earlierStart = max(0, focus.location - 600)
-        let earlier = field.text.substring(with: NSRange(location: earlierStart, length: focus.location - earlierStart))
-        let system = Prompts.spellingSystem(fixCapitals: SystemAutocorrect.capitalizationIsOff)
-        let user = Prompts.spellingUser(app: field.appName, earlier: earlier, focus: text)
-        let element = field.element
-        checkInFlight = true
-        Task {
-            defer {
-                checkInFlight = false
-                if let next = queuedCheck {
-                    queuedCheck = nil
-                    requestCheck(includingWordAtCursor: next)
-                }
-            }
-            do {
-                let result = try await client.structured(
-                    SpellingResult.self, system: system, user: user,
-                    schema: Prompts.spellingSchema, timeout: 12)
-                var unsure: [(String, String, String)] = []
-                for c in result.corrections {
-                    let original = Prompts.stripMarks(c.original)
-                    guard !original.isEmpty, original != c.replacement, !settings.isIgnored(original) else { continue }
-                    let change = TextTools.narrowChange(original, c.replacement)
-                    if c.certain, change.isWordLevel, !settings.isIgnored(change.original) {
-                        enqueueEdit(afterPause: true) { engine in
-                            await engine.apply(change, of: original, in: element, near: focus.location)
-                        }
-                    } else {
-                        // Bigger changes wait, in addSuggestions, until you've finished the sentence.
-                        unsure.append((original, c.replacement, change.isWordLevel ? "Did you mean this?" : "Fix this?"))
-                    }
-                }
-                if !unsure.isEmpty { addSuggestions(unsure, fromReview: false, element: element, near: focus.location) }
-                clearError()
-            } catch {
-                report(error)
-            }
-        }
-    }
-
-    /// Fixes the one word in `change`, found inside `original` behind the cursor near where it was seen, and
-    /// flashes it. A word you've since kept typing into no longer matches as a whole word, so it's left alone.
-    @discardableResult
-    private func apply(_ change: TextTools.Change, of original: String, in element: AXUIElement, near hint: Int) async -> Bool {
-        guard let field = FocusedField.current(), CFEqual(field.element, element) else { return false }
-        let caret = field.selection.location
-        let lo = max(0, hint - 40)
-        guard caret > lo,
-              let whole = TextTools.locate(original, in: field.text, near: hint,
-                                           within: NSRange(location: lo, length: caret - lo)) else { return false }
-        let range = NSRange(location: whole.location + change.offset, length: (change.original as NSString).length)
-        let fixed = TextTools.matchCase(of: change.original, to: change.replacement)
-        guard await field.replace(range, with: fixed, holding: tap) else { return false }
-        if let rect = field.screenRect(for: NSRange(location: range.location, length: (fixed as NSString).length)) {
-            overlay.flash(rect)
-        }
-        recentFixes.insert(Fix(original: change.original, replacement: fixed, location: range.location, element: element), at: 0)
-        if recentFixes.count > 15 { recentFixes.removeLast() }
-        onChange?()
-        return true
-    }
-
-    func undoLastFix() {
-        if let fix = recentFixes.first { undo(fix) }
-    }
-
-    /// Puts back what was typed, and stops fixing that word from now on.
-    func undo(_ fix: Fix) {
-        recentFixes.removeAll { $0.location == fix.location && $0.replacement == fix.replacement }
-        settings.ignore(fix.original)
-        onChange?()
-        enqueueEdit(afterPause: false) { engine in
-            guard let field = FocusedField.current(), CFEqual(field.element, fix.element),
-                  let range = TextTools.locate(fix.replacement, in: field.text, near: fix.location, within: nil) else { return }
-            _ = await field.replace(range, with: fix.original, holding: engine.tap)
-        }
-    }
-
-    // MARK: Suggestions
-
-    private func restartPauseTimer() {
-        checkPauseTimer?.invalidate()
-        checkPauseTimer = Timer.scheduledTimer(withTimeInterval: Self.checkPauseDelay, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated { self?.requestCheck(includingWordAtCursor: true) }
-        }
+    private func restartPauseTimer(_ delay: TimeInterval) {
         pauseTimer?.invalidate()
-        guard settings.intensity != .light else { return }
-        pauseTimer = Timer.scheduledTimer(withTimeInterval: Self.pauseDelay, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated { self?.review() }
+        pauseTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.check() }
         }
     }
 
-    private func review() {
-        guard settings.enabled, settings.intensity != .light,
-              let field = FocusedField.current(), !settings.isExcluded(field.bundleID) else { return }
+    // MARK: Checking
+
+    private func check() {
+        guard isActive, let field = FocusedField.current(), !settings.isExcluded(field.bundleID),
+              field.selection.length == 0 else { return }
         let full = field.text as String
-        guard TextTools.wordCount(full) >= 8, full != lastReviewedText, let client = makeClient() else { return }
-        lastReviewedText = full
+        guard TextTools.wordCount(full) >= 3, full != lastChecked, let client = makeClient() else { return }
+        lastChecked = full
 
         let caret = min(field.selection.location, field.text.length)
         let window = TextTools.window(in: field.text, around: caret, radius: 3000)
         let slice = field.text.substring(with: window) as NSString
         let marked = slice.replacingCharacters(in: NSRange(location: caret - window.location, length: 0), with: Prompts.cursor)
-        let system = Prompts.suggestionSystem(intensity: settings.intensity, avoid: settings.dismissals)
-        let user = Prompts.suggestionUser(app: field.appName, text: marked)
+        let system = Prompts.reviewSystem(intensity: settings.intensity, avoid: settings.dismissals,
+                                          fixCapitals: SystemAutocorrect.capitalizationIsOff)
+        let user = Prompts.reviewUser(app: field.appName, text: marked)
         let element = field.element
 
-        reviewTask?.cancel()
-        reviewTask = Task {
+        checkTask?.cancel()
+        checkTask = Task {
             do {
                 let result = try await client.structured(
-                    SuggestionResult.self, system: system, user: user,
-                    schema: Prompts.suggestionSchema, timeout: 25)
+                    ReviewResult.self, system: system, user: user, schema: Prompts.reviewSchema, timeout: 25)
                 guard !Task.isCancelled else { return }
-                let items = result.suggestions
-                    .filter { !$0.original.contains(Prompts.flagOpen) && $0.original != $0.replacement }
-                    .filter { !settings.wasDismissed(original: $0.original, replacement: $0.replacement) }
-                    .map { ($0.original, $0.replacement, $0.reason) }
-                addSuggestions(items, fromReview: true, element: element, near: caret)
+                show(result.suggestions, element: element, near: caret)
                 clearError()
             } catch {
                 report(error)
@@ -265,38 +153,84 @@ final class Engine {
         }
     }
 
-    private func addSuggestions(_ items: [(String, String, String)], fromReview: Bool, element: AXUIElement, near hint: Int) {
-        guard let field = FocusedField.current(), CFEqual(field.element, element) else { return }
-        if let current = suggestionElement, !CFEqual(current, element) { suggestions.removeAll() }
-        if fromReview { suggestions.removeAll { $0.fromReview } }
-        hideCard()
-        suggestionElement = element
-        // Anything beyond a single word waits until you've moved on from its sentence. It comes back from the
-        // next check or review once you have.
+    /// Replaces the underlines with a fresh set from a check.
+    private func show(_ items: [ReviewResult.Item], element: AXUIElement, near hint: Int) {
+        guard isActive, let field = FocusedField.current(), CFEqual(field.element, element) else { return }
         let finished = TextTools.finishedEnd(in: field.text, caret: field.selection.location)
-        for (original, replacement, reason) in items {
-            guard let range = TextTools.locate(original, in: field.text, near: hint, within: nil),
-                  !suggestions.contains(where: { NSIntersectionRange($0.range, range).length > 0 }) else { continue }
-            let wordLevel = !fromReview && TextTools.narrowChange(original, replacement).isWordLevel
-            guard wordLevel || NSMaxRange(range) <= finished else { continue }
-            suggestions.append(Suggestion(original: original, replacement: replacement, reason: reason,
-                                          fromReview: fromReview, range: range))
+        var fresh: [Suggestion] = []
+        for item in items {
+            let kind = SuggestionKind(rawValue: item.kind) ?? .sentence
+            guard kind == .word || settings.intensity != .light else { continue }
+            let original = Prompts.stripMarks(item.original)
+            var options: [String] = []
+            for r in item.replacements where !r.isEmpty && r != original && !options.contains(r) { options.append(r) }
+            options = Array(options.prefix(3))
+            guard !original.isEmpty, !options.isEmpty,
+                  !(kind == .word && settings.isIgnored(original)),
+                  !settings.wasDismissed(original: original, replacement: options[0]),
+                  let range = TextTools.locate(original, in: field.text, near: hint, within: nil),
+                  // A sentence waits until you've moved on from it.
+                  kind == .word || NSMaxRange(range) <= finished,
+                  !fresh.contains(where: { NSIntersectionRange($0.range, range).length > 0 }) else { continue }
+            fresh.append(Suggestion(kind: kind, original: original, options: options, reason: item.reason, range: range))
         }
+        hideCard()
+        self.element = element
+        suggestions = fresh
         render(field)
     }
 
+    // MARK: Drawing
+
     private func render(_ field: FocusedField) {
-        overlay.showUnderlines(suggestions.flatMap { field.lineRects(for: $0.range) })
-        if suggestions.isEmpty {
-            followTimer?.invalidate()
-            followTimer = nil
-        } else if followTimer == nil {
-            // Keep underlines on their words while the text scrolls or reflows.
+        lastField = field
+        let frame = field.frame
+        rects = suggestions.map { s in
+            let lines = field.lineRects(for: s.range)
+            // Some apps report nothing, or the whole box, for a range. Those go in the list instead.
+            guard !lines.isEmpty, let frame, lines.allSatisfy({ frame.insetBy(dx: -6, dy: -6).contains($0) }) else { return [] }
+            return lines
+        }
+        if settle.isSettling {
+            overlay.hideUnderlines()
+            overlay.hideList()
+        } else {
+            overlay.showUnderlines(zip(suggestions, rects).flatMap { s, lines in lines.map { ($0, s.kind) } })
+            let unplaced = suggestions.indices.filter { rects[$0].isEmpty }
+            if unplaced.isEmpty {
+                overlay.hideList()
+            } else {
+                overlay.showList(unplaced.map { suggestions[$0] }, near: frame ?? field.caretRect,
+                                 accept: { [weak self] i in self?.accept([unplaced[i]]) },
+                                 skip: { [weak self] i in self?.skip(unplaced[i]) },
+                                 acceptAll: { [weak self] in self?.acceptAll() })
+            }
+        }
+        watch(!suggestions.isEmpty)
+        onChange?()
+    }
+
+    /// Timers and monitors run only while there are underlines to keep in place.
+    private func watch(_ on: Bool) {
+        if on, followTimer == nil {
+            // Keep underlines on their words while the text reflows.
             followTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.follow() }
             }
+            mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown]) { [weak self] event in
+                MainActor.assumeIsolated { self?.mouse(clicked: event.type == .leftMouseDown) }
+            }
+            scrollMonitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                MainActor.assumeIsolated { self?.scrolled(event) }
+            }
+        } else if !on, followTimer != nil {
+            followTimer?.invalidate()
+            followTimer = nil
+            for monitor in [mouseMonitor, scrollMonitor].compactMap({ $0 }) { NSEvent.removeMonitor(monitor) }
+            mouseMonitor = nil
+            scrollMonitor = nil
+            stopSettling()
         }
-        onChange?()
     }
 
     private func scheduleFollow() {
@@ -308,10 +242,12 @@ final class Engine {
         }
     }
 
-    /// Re-finds each suggestion's text after edits; drops the ones whose text is gone.
+    /// Re-finds each suggestion's exact text after edits; drops the ones whose text is gone.
     private func follow() {
-        guard let field = FocusedField.current(), let element = suggestionElement, CFEqual(field.element, element) else {
+        guard !settle.isSettling else { return }
+        guard let field = FocusedField.current(), let element, CFEqual(field.element, element) else {
             overlay.hideUnderlines()
+            overlay.hideList()
             hideCard()
             return
         }
@@ -326,57 +262,200 @@ final class Engine {
         render(field)
     }
 
-    private func showCard() -> Bool {
-        guard let field = FocusedField.current(), let element = suggestionElement, CFEqual(field.element, element) else { return false }
+    // MARK: Scrolling
+
+    /// Underlines can't keep up with another app's scrolling, so they hide and come back once it stops.
+    private func scrolled(_ event: NSEvent) {
+        guard event.scrollingDeltaX != 0 || event.scrollingDeltaY != 0 else { return }
+        settle.scrolled()
+        overlay.hideUnderlines()
+        overlay.hideList()
+        hideCard()
+        guard settleTimer == nil else { return }
+        settleTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkSettled() }
+        }
+    }
+
+    private func checkSettled() {
+        guard settle.check(frame: lastField?.frame) else { return }
+        stopSettling()
+        follow()
+    }
+
+    private func stopSettling() {
+        settleTimer?.invalidate()
+        settleTimer = nil
+        settle = ScrollSettle()
+    }
+
+    // MARK: Card
+
+    private func index(at point: NSPoint) -> Int? {
+        rects.indices.first { i in rects[i].contains { $0.insetBy(dx: -1, dy: -3).contains(point) } }
+    }
+
+    private func mouse(clicked: Bool) {
+        guard !settle.isSettling else { return }
+        let point = NSEvent.mouseLocation
+        hoverWork?.cancel()
+        if let i = index(at: point) {
+            guard cardIndex != i || cardFromKeyboard else { return }
+            // A short dwell, so passing over a word on the way somewhere doesn't pop a card up.
+            if clicked {
+                showCard(i, fromKeyboard: false)
+            } else {
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self, index(at: NSEvent.mouseLocation) == i else { return }
+                    showCard(i, fromKeyboard: false)
+                }
+                hoverWork = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+            }
+        } else if cardIndex != nil, !cardFromKeyboard {
+            // Time to reach the card. Over the card itself this monitor goes quiet, so it stays.
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, !overlay.cardContains(NSEvent.mouseLocation),
+                      index(at: NSEvent.mouseLocation) == nil else { return }
+                hideCard()
+            }
+            hoverWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
+        }
+    }
+
+    private func showNearestCard() -> Bool {
+        guard let field = FocusedField.current(), let element, CFEqual(field.element, element) else { return false }
         let caret = field.selection.location
-        guard let index = suggestions.indices.min(by: {
+        guard let i = suggestions.indices.filter({ !rects[$0].isEmpty }).min(by: {
             abs(NSMaxRange(suggestions[$0].range) - caret) < abs(NSMaxRange(suggestions[$1].range) - caret)
-        }), let rect = field.screenRect(for: suggestions[index].range) else { return false }
-        cardIndex = index
-        overlay.showCard(for: suggestions[index], below: rect)
+        }) else { return false }
+        showCard(i, fromKeyboard: true)
         return true
     }
 
+    private func showCard(_ i: Int, fromKeyboard: Bool) {
+        guard suggestions.indices.contains(i), let anchor = rects[i].first else { return }
+        cardIndex = i
+        cardFromKeyboard = fromKeyboard
+        let s = suggestions[i]
+        overlay.showCard(for: s, below: anchor, keyboard: fromKeyboard,
+                         accept: { [weak self] in self?.accept([i]) },
+                         skip: { [weak self] in self?.skip(i) },
+                         cycle: { [weak self] step in self?.cycle(i, by: step) })
+    }
+
     private func hideCard() {
+        hoverWork?.cancel()
+        guard cardIndex != nil else { return }
         cardIndex = nil
         overlay.hideCard()
     }
 
-    private func accept(_ index: Int) {
+    private func cycle(_ i: Int, by step: Int) {
+        guard suggestions.indices.contains(i) else { return }
+        let count = suggestions[i].options.count
+        suggestions[i].choice = (suggestions[i].choice + step + count) % count
+        showCard(i, fromKeyboard: cardFromKeyboard)
+    }
+
+    private func skip(_ i: Int) {
         hideCard()
-        guard suggestions.indices.contains(index) else { return }
-        let s = suggestions.remove(at: index)
+        guard suggestions.indices.contains(i) else { return }
+        let s = suggestions.remove(at: i)
+        if s.kind == .word, !s.original.contains(where: \.isWhitespace) { settings.ignore(s.original) }
+        settings.recordDismissal(original: s.original, replacement: s.replacement)
         follow()
-        enqueueEdit(afterPause: false) { engine in
-            guard let field = FocusedField.current(),
-                  let range = TextTools.locate(s.original, in: field.text, near: s.range.location, within: nil) else { return }
-            if await field.replace(range, with: s.replacement, holding: engine.tap),
-               let rect = field.screenRect(for: NSRange(location: range.location, length: (s.replacement as NSString).length)) {
-                engine.overlay.flash(rect)
+    }
+
+    // MARK: Accepting
+
+    func acceptAll() {
+        accept(Array(suggestions.indices))
+    }
+
+    /// Applies the chosen suggestions as one step, from the end of the text backwards. Each is checked
+    /// against a fresh read of the field first, and skipped if its text no longer matches exactly.
+    private func accept(_ indices: [Int]) {
+        hideCard()
+        let wanted = indices.filter { suggestions.indices.contains($0) }.map { suggestions[$0] }
+        // Bring positions up to date first. That can drop or reorder suggestions, so match them up by their text.
+        follow()
+        let picked: [Suggestion] = wanted.compactMap { w in
+            guard var s = suggestions.filter({ $0.original == w.original && $0.options == w.options })
+                .min(by: { abs($0.range.location - w.range.location) < abs($1.range.location - w.range.location) })
+            else { return nil }
+            s.choice = w.choice
+            return s
+        }
+        guard !picked.isEmpty, let element else { return }
+        suggestions.removeAll { s in picked.contains { $0.range == s.range && $0.original == s.original } }
+        if let field = lastField { render(field) }
+        let edits = picked.map { PlannedEdit(range: $0.range, original: $0.original, replacement: $0.replacement) }
+        enqueueEdit { engine in
+            let applied = await engine.run(edits, in: element, flash: true)
+            if !applied.isEmpty {
+                engine.undoStack.append((element, applied))
+                if engine.undoStack.count > 10 { engine.undoStack.removeFirst() }
             }
+            if applied.count < edits.count {
+                NSLog("Typestro: %d of %d suggestions no longer matched the text and were skipped",
+                      edits.count - applied.count, edits.count)
+            }
+            engine.lastChecked = nil
             engine.follow()
         }
     }
 
-    private func dismiss(_ index: Int) {
+    /// Puts back everything the last accept changed.
+    func undoLast() {
+        guard let last = undoStack.popLast() else { return }
         hideCard()
-        guard suggestions.indices.contains(index) else { return }
-        let s = suggestions.remove(at: index)
-        if s.fromReview {
-            settings.recordDismissal(original: s.original, replacement: s.replacement)
-        } else {
-            settings.ignore(s.original)
+        enqueueEdit { engine in
+            _ = await engine.run(EditPlan.undo(of: last.edits), in: last.element, flash: false)
+            engine.lastChecked = nil
+            engine.follow()
         }
-        follow()
     }
 
+    private func enqueueEdit(_ edit: @escaping @MainActor (Engine) async -> Void) {
+        let previous = editTask
+        editTask = Task { [weak self] in
+            await previous?.value
+            guard let self else { return }
+            await edit(self)
+            onChange?()
+        }
+    }
+
+    /// Makes `edits` in apply order with your keys held throughout. Returns the ones that were made.
+    private func run(_ edits: [PlannedEdit], in element: AXUIElement, flash: Bool) async -> [PlannedEdit] {
+        tap.hold()
+        defer { tap.release() }
+        var applied: [PlannedEdit] = []
+        for edit in EditPlan.applyOrder(edits) {
+            guard let field = FocusedField.current(), CFEqual(field.element, element) else { break }
+            guard edit.matches(field.text), await field.replace(edit.range, with: edit.replacement, holding: tap) else { continue }
+            applied.append(edit)
+            if flash, let rect = field.screenRect(for: NSRange(location: edit.range.location,
+                                                                length: (edit.replacement as NSString).length)) {
+                overlay.flash(rect)
+            }
+        }
+        return applied
+    }
+
+    /// Also forgets what was last checked, so the next pause reads the text afresh (after a level change, say).
     func clearSuggestions() {
+        lastChecked = nil
+        checkTask?.cancel()
         suggestions.removeAll()
-        suggestionElement = nil
+        rects.removeAll()
+        element = nil
         hideCard()
         overlay.hideUnderlines()
-        followTimer?.invalidate()
-        followTimer = nil
+        overlay.hideList()
+        watch(false)
         onChange?()
     }
 
@@ -384,7 +463,7 @@ final class Engine {
 
     private func makeClient() -> ClaudeClient? {
         guard let key = settings.apiKey else {
-            lastError = "Add a Claude API key to turn on AI fixes"
+            lastError = "Add a Claude API key to turn on suggestions"
             onChange?()
             return nil
         }

@@ -1,7 +1,7 @@
 # Typestro
 
-macOS menu bar app (Swift, SwiftUI/AppKit, no dependencies) that fixes typing in any app by context with Claude,
-suggests edits on pause, and does hold-to-talk dictation (OpenAI GPT Transcribe + Claude cleanup). See README.md.
+macOS menu bar app (Swift, SwiftUI/AppKit, no dependencies) that underlines what could be better in your typing, in any app, using Claude (it never edits on its own),
+and does hold-to-talk dictation (OpenAI GPT Transcribe + Claude cleanup). See README.md.
 
 - Build: `make run` (SwiftPM + build.sh assembles a universal `build/Typestro.app`, Developer ID signed). `make install`
   puts it in /Applications. No .xcodeproj; open Package.swift in Xcode to edit.
@@ -18,9 +18,11 @@ suggests edits on pause, and does hold-to-talk dictation (OpenAI GPT Transcribe 
   claims accessibility edits succeed without doing them, so edits there select only the word, type over it and put
   the cursor back. Never backspace-and-retype the text after a word: it erased whole lines and raced the user's
   typing. While an edit runs, `KeyTap.hold()` keeps real key presses back and replays them afterwards.
-- Silent fixes are single words only (`TextTools.narrowChange(...).isWordLevel`), made after a 0.35 s pause.
-  Anything that changes a sentence's structure is only ever a suggestion, and only once that sentence is finished
-  (`TextTools.finishedEnd`).
+- Suggestions-first: Typestro never edits text on its own. `Engine` checks on a pause or a finished sentence (one
+  `Prompts.reviewSystem` request returning `word` and `sentence` items) and only draws underlines; text changes only
+  when a suggestion is accepted. Accepting re-reads the field and applies `EditPlan`s from the end backwards,
+  skipping any whose `original` no longer matches exactly; one undo reverses the whole batch. Sentence items only
+  show once that sentence is finished (`TextTools.finishedEnd`).
 - Prompts are in `Sources/TypestroCore/Prompts.swift`; `make probe` runs them on sample sentences.
 - The update check and usage ping go to `https://mattmoglia.com/api/typestro` (served by the portfolio repo, like
   AudioPin's `/api/audiopin`).

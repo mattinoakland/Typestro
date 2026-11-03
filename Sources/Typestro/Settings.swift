@@ -24,6 +24,12 @@ final class Settings {
         set { defaults.set(newValue, forKey: "enabled") }
     }
 
+    /// Underlines while you type. Off leaves dictation working; Pause turns off both.
+    var suggestionsEnabled: Bool {
+        get { defaults.object(forKey: "suggestionsEnabled") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "suggestionsEnabled") }
+    }
+
     var intensity: Intensity {
         get { Intensity(rawValue: defaults.string(forKey: "intensity") ?? "") ?? .medium }
         set { defaults.set(newValue.rawValue, forKey: "intensity") }

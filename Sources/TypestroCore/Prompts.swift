@@ -1,31 +1,28 @@
 import Foundation
 
-/// How much Typestro speaks up beyond spelling.
+/// How much Typestro points out beyond spelling.
 public enum Intensity: String, CaseIterable, Sendable {
     case light, medium, full
 
     public var title: String {
         switch self {
-        case .light: "Light: spelling only"
-        case .medium: "Medium: clarity and word choice"
-        case .full: "Full: tone and flow too"
+        case .light: "Light: spelling and wrong words"
+        case .medium: "Medium: adds grammar and clarity"
+        case .full: "Full: adds tightening and flow"
         }
     }
 }
 
-public struct SpellingResult: Decodable, Sendable {
-    public struct Correction: Decodable, Sendable {
-        public let original: String
-        public let replacement: String
-        public let certain: Bool
-    }
-    public let corrections: [Correction]
+/// The two underline styles: a misspelled or wrong word, or a sentence that could read better.
+public enum SuggestionKind: String, Sendable {
+    case word, sentence
 }
 
-public struct SuggestionResult: Decodable, Sendable {
+public struct ReviewResult: Decodable, Sendable {
     public struct Item: Decodable, Sendable {
+        public let kind: String
         public let original: String
-        public let replacement: String
+        public let replacements: [String]
         public let reason: String
     }
     public let suggestions: [Item]
@@ -46,88 +43,58 @@ public enum Prompts {
             .replacingOccurrences(of: flagClose, with: "")
     }
 
-    // MARK: Spelling
+    // MARK: Review
 
-    /// - Parameter fixCapitals: when macOS isn't capitalizing (Typestro switched it off), Claude does it,
-    ///   with the sentence in view, instead of leaving capitalization alone.
-    public static func spellingSystem(fixCapitals: Bool) -> String {
+    /// One read of the text, run when they pause or finish a sentence. Nothing is ever applied by itself:
+    /// every item becomes an underline they can accept or skip.
+    ///
+    /// - Parameter fixCapitals: when macOS isn't capitalizing (Typestro switched it off), capitalization
+    ///   slips count as word items too.
+    public static func reviewSystem(intensity: Intensity, avoid: [String], fixCapitals: Bool) -> String {
         let capitals = fixCapitals ? """
 
-        4. Capitalization: the first word of each sentence, and "I" with its contractions ("i" → "I", "im" → "I'm", "ive" → "I've", "i'll" → "I'll"). Also names written in lowercase when they are clearly names: people, places, days, months ("see you monday" → "Monday"). Leave capitalization that looks deliberate, like a handle, a brand's own styling (iPhone, eBay), or someone writing in all lowercase on purpose across the whole text.
+        - Capitalization: the first word of each sentence, and "I" with its contractions ("i" → "I", "im" → "I'm"). Also names written in lowercase when they are clearly names: people, places, days, months. Leave capitalization that looks deliberate, like a handle, a brand's own styling (iPhone, eBay), or someone writing in all lowercase on purpose.
         """ : ""
-        let leaveAlone = fixCapitals
-            ? "word choice, grammar, punctuation, style"
-            : "word choice, grammar, punctuation, capitalization, style"
-        let caseRule = fixCapitals
-            ? "\"replacement\" is the corrected text."
-            : "\"replacement\" is the corrected text in the same capitalization style."
-        return """
-        You fix spelling for a writing assistant that runs while someone types on their Mac. They write in their own words. Your only job is to make sure each word is spelled as the word they meant. You never change what they are saying.
-
-        Fix only these:
-        1. Misspelled words, including phonetic spellings that are far from the real word: "sirkumstanses" → "circumstances", "rekamend" → "recommend", "fenominal" → "phenomenal".
-        2. A real word typed where a different word was clearly meant, usually a sound-alike or a slip: their/there/they're, your/you're, its/it's, to/too, by/buy, then/than, lose/loose, affect/effect, meat/meet, "could of" → "could have".
-        3. A real word that makes no sense in the sentence, often a typo that landed on another word or a bad autocorrect, when the sentence makes the intended word obvious: "piecing the right word" → "picking the right word", "I'll be their in ten minuets" → "minutes", "form now on" → "from now on".\(capitals)
-
-        The test for 2 and 3: the word as typed doesn't fit, and anyone reading the sentence would know the word they meant. A word that fits but could be better is word choice, not yours to change.
-
-        Leave everything else alone: \(leaveAlone), slang and casual spellings (gonna, lol, u, ya, tho), names, brands, technical terms, and other languages. If a word might be deliberate, leave it.
-
-        "Check" is what they just typed, often stopping mid-sentence because they're still going. Read every word in it against the whole context. A word that doesn't fit may be explained by what comes next, so if the sentence is unfinished and you can't yet tell what they meant, leave that word. Never correct anything in "Earlier text"; it is there only so you understand the context.
-
-        For each fix, "original" is the exact text to replace, copied character for character, usually a single word ("could of" is two). \(caseRule) Set "certain" to true only when the context makes the intended word unambiguous; if more than one word is plausible, set it to false.
-
-        Most of the time there is nothing to fix. Return an empty list then.
-        """
-    }
-
-    public static func spellingUser(app: String, earlier: String, focus: String) -> String {
-        var s = "App: \(app)\n"
-        if !earlier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            s += "\nEarlier text:\n\(earlier)\n"
-        }
-        s += "\nCheck:\n\(focus)"
-        return s
-    }
-
-    public static let spellingSchema: [String: Any] = object([
-        "corrections": [
-            "type": "array",
-            "items": object(["original": string, "replacement": string, "certain": ["type": "boolean"]]),
-        ],
-    ])
-
-    // MARK: Suggestions
-
-    public static func suggestionSystem(intensity: Intensity, avoid: [String]) -> String {
-        var worth = """
-        - a word that doesn't mean what they intend
-        - a missing, doubled, or leftover word
+        var sentence = """
         - a grammar slip that makes a sentence read wrong
+        - a missing, doubled, or leftover word
         - a run-on or tangled sentence that hides the point
-        - the same word used so often it stands out
+        - a word that doesn't mean what they intend
         """
         if intensity == .full {
-            worth += """
+            sentence += """
 
+            - wordy phrasing that could be tighter without losing anything
+            - a sentence whose order or rhythm makes it hard to follow
             - a phrase that will probably come across differently than they intend (harsher, colder, more unsure)
-            - a sentence whose order makes the point hard to follow
             """
         }
+        let sentenceSection = intensity == .light
+            ? "Return only \"word\" items. Never return \"sentence\" items."
+            : """
+            "sentence": a sentence that could read better. Worth pointing out:
+            \(sentence)
+            Only for sentences they have finished: never the sentence ⟦cursor⟧ is in. Make the smallest edit that fixes it: a word or a clause, not a whole sentence, and never a paragraph. Keep their voice: the same tone, vocabulary, contractions, slang and personality. It should sound like them on a good day, not like an AI wrote it. At most 3 of these.
+            """
         var s = """
-        You are a quiet editor in the typestro while someone writes in their own voice. They didn't ask you to write for them. Read the whole text, work out what they are trying to say, and point out at most 3 places where a small change would make it clearly better.
+        You are a quiet proofreader built into someone's Mac. While they write in any app, you read what they have written and point out the spots worth changing. You never change anything yourself: each item becomes an underline they can accept or skip, so only return things they would thank you for.
 
-        Worth pointing out:
-        \(worth)
+        There are two kinds of item.
 
-        How to suggest:
-        - Make the smallest edit that fixes it: a word or a clause, not a whole sentence, and never a paragraph.
-        - Keep their voice: the same tone, vocabulary, contractions, slang and personality. The result should sound like them on a good day, not like an AI wrote it.
-        - Ignore spelling mistakes; another layer fixes those.
-        - ⟦cursor⟧ marks where they are typing. If the text just before it is unfinished, leave that part alone.
-        - "original" is the exact text to replace, copied character for character, and long enough to appear only once in the text. "replacement" is what it becomes. "reason" is 2 to 5 plain words, like "missing word", "clearer", or "sounds sharper than meant".
+        "word": a single word that is wrong. Point out:
+        - Misspelled words, including phonetic spellings far from the real word: "sirkumstanses" → "circumstances", "rekamend" → "recommend".
+        - A real word typed where a different word was clearly meant, usually a sound-alike or a slip: their/there/they're, your/you're, its/it's, to/too, by/buy, then/than, "could of" → "could have".
+        - A real word that makes no sense in the sentence when the sentence makes the intended word obvious: "piecing the right word" → "picking the right word", "form now on" → "from now on".\(capitals)
+        Leave slang and casual spellings (gonna, lol, u, ya, tho), names, brands, technical terms and other languages alone. If a word might be deliberate, leave it. Skip the word right before ⟦cursor⟧ if it looks unfinished. At most 8 of these.
 
-        Only suggest real improvements. Most text is fine as it is; return an empty list then.
+        \(sentenceSection)
+
+        For every item:
+        - "original" is the exact text to replace, copied character for character. For a word item, just that word (or the two words, as in "could of"). For a sentence item, long enough to appear only once in the text.
+        - "replacements" is what it could become, best first. Usually one. Give two or three only when they are genuinely different good choices.
+        - "reason" is 2 to 5 plain words, like "spelling", "wrong word", "missing word", "tighter", or "sounds sharper than meant".
+
+        Most text needs little or nothing. Return an empty list then.
         """
         if !avoid.isEmpty {
             s += "\n\nThis writer has turned down suggestions like these, so skip anything similar:\n"
@@ -136,14 +103,19 @@ public enum Prompts {
         return s
     }
 
-    public static func suggestionUser(app: String, text: String) -> String {
+    public static func reviewUser(app: String, text: String) -> String {
         "App: \(app)\n\nText:\n\(text)"
     }
 
-    public static let suggestionSchema: [String: Any] = object([
+    public static let reviewSchema: [String: Any] = object([
         "suggestions": [
             "type": "array",
-            "items": object(["original": string, "replacement": string, "reason": string]),
+            "items": object([
+                "kind": ["type": "string", "enum": ["word", "sentence"]],
+                "original": string,
+                "replacements": ["type": "array", "items": string],
+                "reason": string,
+            ]),
         ],
     ])
 
